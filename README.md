@@ -1,189 +1,129 @@
-# MIPS32 Softmax Accelerator
+# Softmax Hardware Accelerator
 
-A research-oriented RTL project extending a MIPS32 pipeline with a custom
-instruction dedicated to accelerating the Softmax operation used in
-Transformer attention. This project deliberately narrows scope to a
-**single operator** rather than a full Transformer datapath, to keep the
-work finishable and rigorously evaluated.
+A synthesizable, all-combinational-plus-FSM RTL implementation of Softmax in
+IEEE-754 single-precision (FP32), built from scratch: custom FP32 adder and
+multiplier, a piecewise-linear exponential unit, a LUT + Newton–Raphson
+reciprocal unit, and a control FSM that ties them together into a working
+4-element Softmax datapath.
 
-> **Status: early-stage.** The MIPS32 core is implemented. The Softmax
-> accelerator itself (exponential unit, accumulator, normalization, custom
-> decode) is design-in-progress, not yet built. See [Current Status](#current-status)
-> for the honest breakdown.
-
-## Motivation
-
-Softmax is a fundamental operation in Transformer attention:
+> **Status honesty note:** an earlier version of this README described a
+> MIPS32 CPU with a custom Softmax instruction. That CPU/ISA work does not
+> exist in this repository yet — there is no `cpu/`, `custom_isa/`, or
+> `software/` directory. What exists today is the standalone Softmax
+> accelerator datapath described below. See
+> [`docs/future_work.md`](docs/future_work.md) for what MIPS integration
+> would actually require.
 
 ```
 Softmax(x_i) = exp(x_i) / sum_j(exp(x_j))
 ```
 
-Matrix multiplication dominates the FLOP count in Transformer workloads,
-but Softmax is disproportionately expensive to execute efficiently on a
-general-purpose core: it requires exponentiation, an accumulation across a
-row, and a division per element — none of which map cleanly onto a
-standard integer/float ALU pipeline. Division especially is costly in
-hardware, and exponentials are usually done in software via costly
-iterative approximations.
+## What's actually implemented
 
-This project asks a narrow, answerable question: **does routing Softmax
-through a dedicated custom MIPS32 instruction, backed by a small hardware
-unit for exponential approximation and reciprocal-based division, reduce
-latency and improve resource/energy efficiency compared to a pure-software
-Softmax on the same core** — and at what numerical accuracy cost?
-
-This is a deliberately smaller scope than related work such as RISC-VTF
-(Jiao et al., 2021 SMC), which implements a full custom instruction set
-for load/store, matrix multiply, matrix add, softmax, and ReLU on a
-RISC-V core. This project isolates the softmax piece and aims to evaluate
-it more rigorously — in particular, unlike that prior work, this project
-tracks **numerical error** of the exponential approximation as a first-class
-metric, not an afterthought.
-
-### Why MIPS32 instead of RISC-V
-
-Most recent custom-ISA accelerator work (including RISC-VTF) targets
-RISC-V, which reserves dedicated `custom-0`–`custom-3` opcode space in its
-spec explicitly for this purpose. MIPS32 has no equivalent reserved
-encoding space, so this project repurposes an unused/reserved opcode
-instead of a spec-sanctioned one. That is a real tradeoff versus RISC-V —
-no comparable toolchain/ecosystem support, and the custom decode has to be
-carved out by convention rather than by design. The choice here is
-pedagogical/practical (building on existing MIPS32 familiarity), not a
-claim that MIPS32 is technically preferable for this kind of extension.
-This tradeoff is stated explicitly so it isn't mistaken for an oversight.
-
-## Architecture
-
-Based on a classic 5-stage MIPS32 pipeline:
+A **fixed-width, 4-input** Softmax pipeline (`x0, x1, x2, x3` in →
+`softmax0..softmax3` out), controlled by an FSM in `softmax_top.v`:
 
 ```
-IF → ID → EX → MEM → WB
+x0..x3 → [exp engine] → [exp accumulator] → sum
+                                              │
+                                     [reciprocal unit] (1/sum)
+                                              │
+exp values ─────────────────────────► [normalizer] → softmax0..softmax3
 ```
 
-A custom Softmax instruction will be added to the ISA, decoded in ID and
-dispatched to a dedicated execution unit alongside the standard ALU:
+No batching, no arbitrary vector length, no exponent-max-subtraction
+(numerical stabilization) — inputs are assumed to already sit inside the
+`[-4, 4]` range the exponential LUT was built for. See
+[`docs/algorithm.md`](docs/algorithm.md) for the exact math and
+[`docs/architecture.md`](docs/architecture.md) for how the modules connect
+(including the modules that are built and tested but **not** currently wired
+into the top level).
+
+## Repository layout
+
+This repo's actual layout does **not** match a "clean" target structure yet.
+Mapping what exists to what a tidier layout would look like:
+
+| In this repo today | Would map to |
+|---|---|
+| `rtl/fp32/` | `rtl/arithmetic/` |
+| `rtl/reciprocal_unit/` (top-level) | `rtl/softmax/reciprocal_unit.v` |
+| `rtl/exp/` | matches |
+| `rtl/softmax/` | matches, minus dead files (see below) |
+| `rtl/top/softmax_top.v` | matches |
+| `tb/fp32/`, `tb/reciprocal/`, `tb/softmax/` | should split into `tb/arithmetic/`, `tb/exp/`, `tb/softmax/`, `tb/top/` — **`tb/exp/` doesn't exist**, there is no standalone testbench for `exp_unit`/`exp_lut`/`region_detector` |
+
+Known cruft that should be deleted or resolved, not documented as if it's
+fine:
+
+- `rtl/softmax/reciprocal_unit.v` — **empty file** (0 bytes), dead stub,
+  same module name as the real `reciprocal_unit`. Delete it.
+- `softmax_exp_accumulator.V` — capital `.V` extension, inconsistent with
+  every other file. Rename to `.v`.
+- `softmax_read_controller.v`, `softmax_normalization_controller.v`,
+  `softmax_normalization_stage.v` — each has a testbench, but none of them
+  is instantiated by `softmax_top.v`. Either wire them in or remove them;
+  right now they're tested dead code.
+
+## Directory structure (target)
 
 ```
-MIPS32 CPU
-      |
-      | Custom Softmax instruction
-      v
-Softmax Accelerator
-      |
-      +── Exponential approximation unit
-      +── Accumulation unit
-      +── Normalization (reciprocal + multiply) unit
-      |
-      v
-   Softmax output
+softmax-hardware-accelerator/
+├── README.md
+├── docs/
+│   ├── architecture.md
+│   ├── algorithm.md
+│   ├── module_documentation.md
+│   ├── verification.md
+│   ├── results.md
+│   └── future_work.md
+├── rtl/
+│   ├── arithmetic/        fp32_adder.v, fp32_multiplier.v
+│   ├── exp/                exp_unit.v, exp_lut.v, region_detector.v
+│   ├── softmax/             input_selector.v, softmax_exp_engine.v,
+│   │                        exp_accumulator.v, reciprocal_unit.v,
+│   │                        softmax_normalizer.v, ...
+│   └── top/                 softmax_top.v
+├── tb/
+├── simulation/
+├── results/
+├── paper/
+└── .gitignore
 ```
 
-The exponential approximation method (LUT-only, LUT + linear
-interpolation, piecewise-polynomial, or bit-hack float approximation) is
-not yet finalized — see [Open Design Decisions](#open-design-decisions).
+## Quick start (simulation)
 
-## Current Status
+No simulation scripts are checked into the repo yet (no `simulation/`
+contents, no Makefile/run scripts). To run a testbench manually with
+Icarus Verilog:
 
-### Completed
-- MIPS32 5-stage pipeline processor (RTL, no custom instruction yet)
-- Literature review: RISC-V custom ISA extensions for Transformer
-  acceleration, hardware Softmax optimization techniques, hardware
-  exponential approximation methods
-
-### In Progress
-- Custom instruction encoding definition (opcode/field layout)
-- Exponential approximation method selection and error-bound analysis
-- Softmax accelerator RTL design (exponential unit, accumulator,
-  normalization)
-
-### Planned
-- Implement exponential approximation hardware
-- Implement full Softmax accelerator datapath
-- Integrate accelerator into the MIPS32 pipeline (hazard handling, stalls)
-- Software baseline: Softmax via standard MIPS32 instructions
-- Hardware-accelerated Softmax via custom instruction
-- Functional verification (testbenches, directed + randomized vectors)
-- FPGA synthesis and resource/power reporting
-- Baseline vs. accelerated comparison (see metrics below)
-
-## Baseline vs. Proposed Design
-
-**Baseline:** Softmax computed with ordinary MIPS32 instructions —
-software-driven exponential approximation, accumulation loop, and
-division.
-
-**Proposed:** Softmax computed by a single custom instruction that
-dispatches to dedicated hardware.
-
-```
-Baseline:  MIPS32 → sequence of normal instructions → Softmax result
-Proposed:  MIPS32 → single custom instruction → Softmax accelerator → result
+```bash
+iverilog -o sim.out \
+  rtl/arithmetic/fp32_adder.v \
+  rtl/arithmetic/fp32_multiplier.v \
+  rtl/reciprocal_unit/reciprocal_lut.v \
+  rtl/reciprocal_unit/reciprocal_unit.v \
+  tb/reciprocal/reciprocal_unit_tb.v
+vvp sim.out
 ```
 
-### Evaluation metrics
-- Clock cycles per Softmax call (fixed input size, then swept across sizes)
-- End-to-end latency
-- LUT utilization
-- Flip-flop utilization
-- DSP utilization
-- BRAM utilization
-- Power consumption (where the toolchain supports estimation)
-- **Numerical error vs. IEEE-754 float32 softmax** (max and mean absolute
-  error, and effect on argmax stability) — tracked from the first working
-  version, not deferred to "future work"
+Adjust file paths for whichever module you're testing. See
+[`docs/verification.md`](docs/verification.md) for what's actually been
+run and what hasn't.
 
-## Open Design Decisions
+## Current status
 
-These are unresolved and should be settled before RTL for the accelerator
-proceeds, since they drive area/latency/accuracy tradeoffs:
-
-1. **Exponential approximation method.** Candidates: pure lookup table,
-   LUT + linear interpolation, piecewise-polynomial (as in RISC-VTF),
-   Schraudolph-style bit-hack approximation. Each trades LUT size /
-   pipeline depth against worst-case error — pick one and document the
-   justification before implementation.
-2. **Fixed-point vs. floating-point internal representation** for the
-   accumulator and reciprocal stage.
-3. **Row-size scaling.** Whether the accelerator supports arbitrary vector
-   length in hardware or requires software chunking above some size.
-4. **Reciprocal implementation.** One-time reciprocal + multiply (as in
-   RISC-VTF) vs. direct hardware divider — affects both area and latency.
-
-## Repository Structure
-
-```
-rtl/
-├── cpu/            # MIPS32 5-stage pipeline (implemented)
-├── softmax/         # Softmax accelerator datapath (planned)
-└── custom_isa/       # Custom instruction decode logic (planned)
-
-tb/
-├── cpu/             # CPU testbenches
-└── softmax/         # Accelerator testbenches (planned)
-
-software/
-├── baseline/         # Software-only Softmax reference (planned)
-└── accelerated/       # Custom-instruction-driven Softmax test programs (planned)
-
-docs/
-├── architecture.md
-├── isa_extension.md
-└── results.md
-```
-
-## References
-
-- Jiao, Hu, Liu, Dong. "RISC-VTF: RISC-V Based Extended Instruction Set
-  for Transformer." 2021 IEEE International Conference on Systems, Man,
-  and Cybernetics (SMC).
-- Vaswani et al. "Attention Is All You Need." arXiv:1706.03762, 2017.
-- Additional papers on hardware exponential approximation and Softmax
-  optimization to be catalogued in `docs/`.
+| Area | Status |
+|---|---|
+| FP32 adder / multiplier | Implemented, has a testbench |
+| Piecewise-linear exp unit | Implemented, **no standalone testbench** |
+| LUT + Newton-Raphson reciprocal unit | Implemented, tested, results documented (18 vectors, max 0.092% error, positive-only) |
+| Softmax datapath (4-wide) | Implemented, wired end-to-end in `softmax_top.v` |
+| Alternative control modules (read/normalization controller) | Implemented, individually tested, **not integrated** |
+| MIPS32 core / custom instruction | Not started |
+| FPGA synthesis / resource numbers | Not started |
+| `results/` data (CSVs, plots) | Not started |
 
 ## Author
 
-**Arpan Chandra**
-NIT Durgapur
-B.Tech 2023 - 27
+Arpan
