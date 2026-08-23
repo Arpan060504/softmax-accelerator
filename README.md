@@ -184,5 +184,6 @@ docs/
 
 ## Author
 
-Arpan
-NIT Durgapur B.Tech 2023 - 27
+**Arpan Chandra**
+NIT Durgapur
+B.Tech 2023 - 27
