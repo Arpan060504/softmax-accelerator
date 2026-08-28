@@ -1,138 +1,138 @@
-module fp32_adder(a , b , result);
-input  [31:0]  a , b;
-output [31:0] result;
-// unpacking 
-wire sign_a, sign_b;
-wire [7:0] exp_a, exp_b;
-wire [22:0] fraction_a, fraction_b;
-wire [23:0] mantissa_a, mantissa_b;
+`timescale 1ns/1ps
 
-assign sign_a = a[31];
-assign sign_b = b[31];
+module fp32_adder(
+    input  wire [31:0] a,
+    input  wire [31:0] b,
+    output reg  [31:0] result
+);
 
-assign exp_a = a[30:23];
-assign exp_b = b[30:23];
+    wire sign_a = a[31];
+    wire sign_b = b[31];
+    wire [7:0] exp_a = a[30:23];
+    wire [7:0] exp_b = b[30:23];
+    wire [22:0] fraction_a = a[22:0];
+    wire [22:0] fraction_b = b[22:0];
 
-assign fraction_a = a[22:0];
-assign fraction_b = b[22:0];
+    wire [23:0] mantissa_a = (exp_a == 8'd0) ? 24'd0 : {1'b1, fraction_a};
+    wire [23:0] mantissa_b = (exp_b == 8'd0) ? 24'd0 : {1'b1, fraction_b};
 
-assign mantissa_a = {1'b1, fraction_a};
-assign mantissa_b = {1'b1, fraction_b};
-// larger operand and align
-reg [7:0] exp_large;
-reg [7:0] exp_diff;
-reg [23:0] mantissa_large;
-reg [23:0] mantissa_small_aligned;
-reg sign_large;
+    reg [7:0] exp_large;
+    reg [7:0] exp_diff;
+    reg [23:0] mantissa_large;
+    reg [23:0] mantissa_small_aligned;
+    reg sign_large;
 
-always @(*)
-    begin
-        if(exp_a > exp_b)
-            begin
+    reg [24:0] mantissa_result;
+    reg result_sign;
+    reg do_sub;
+
+    reg [4:0] shift_amt;
+    reg [23:0] norm_mantissa;
+    reg signed [9:0] final_exp;
+
+    always @(*) begin
+        // ----------------------------------------------------
+        // 1. Zero bypass
+        // ----------------------------------------------------
+        if (a[30:0] == 31'd0) begin
+            result = b;
+        end else if (b[30:0] == 31'd0) begin
+            result = a;
+        end else begin
+
+            // ------------------------------------------------
+            // 2. Alignment
+            // ------------------------------------------------
+            if (exp_a > exp_b) begin
                 exp_large = exp_a;
-                exp_diff = exp_a - exp_b;
-                mantissa_large =  mantissa_a;
-                mantissa_small_aligned = mantissa_b >> exp_diff;
+                exp_diff  = exp_a - exp_b;
+                mantissa_large = mantissa_a;
+                mantissa_small_aligned = (exp_diff >= 24) ? 24'd0 : (mantissa_b >> exp_diff);
                 sign_large = sign_a;
-            end
-        else if(exp_a < exp_b)
-            begin
+            end else if (exp_a < exp_b) begin
                 exp_large = exp_b;
-                exp_diff = exp_b - exp_a;
-                mantissa_large =  mantissa_b;
-                mantissa_small_aligned = mantissa_a >> exp_diff;
+                exp_diff  = exp_b - exp_a;
+                mantissa_large = mantissa_b;
+                mantissa_small_aligned = (exp_diff >= 24) ? 24'd0 : (mantissa_a >> exp_diff);
                 sign_large = sign_b;
-            end   
-        else 
-            begin
-                // same exponent 
+            end else begin
                 exp_large = exp_a;
-                exp_diff = 0 ;
-                if(mantissa_a >= mantissa_b)
-                    begin
-                        mantissa_large = mantissa_a;
-                        mantissa_small_aligned = mantissa_b;
-                        sign_large = sign_a;
-                    end
-                else
-                    begin
-                            mantissa_large = mantissa_b;
-                            mantissa_small_aligned = mantissa_a;
-                            sign_large = sign_b;
-                    end    
-            end    
-    end
-// decide add / sub
-reg [24:0] mantissa_result;
-reg result_sign;
-reg do_sub;
-always @(*)
-    begin
-        if(sign_a == sign_b) // add
-            begin
-                do_sub = 1'b0; // not a substraction
-                mantissa_result = {1'b0 , mantissa_large} + { 1'b0 ,mantissa_small_aligned} ;
+                exp_diff  = 8'd0;
+                if (mantissa_a >= mantissa_b) begin
+                    mantissa_large = mantissa_a;
+                    mantissa_small_aligned = mantissa_b;
+                    sign_large = sign_a;
+                end else begin
+                    mantissa_large = mantissa_b;
+                    mantissa_small_aligned = mantissa_a;
+                    sign_large = sign_b;
+                end
+            end
+
+            // ------------------------------------------------
+            // 3. Add / Sub operation
+            // ------------------------------------------------
+            if (sign_a == sign_b) begin
+                do_sub = 1'b0;
+                mantissa_result = {1'b0, mantissa_large} + {1'b0, mantissa_small_aligned};
                 result_sign = sign_a;
-            end
-        else // sub
-            begin
+            end else begin
                 do_sub = 1'b1;
-                 mantissa_result = {1'b0 , mantissa_large} - { 1'b0 ,mantissa_small_aligned} ;
-                 result_sign = sign_large;
+                mantissa_result = {1'b0, mantissa_large} - {1'b0, mantissa_small_aligned};
+                result_sign = sign_large;
             end
+
+            // ------------------------------------------------
+            // 4. Normalization
+            // ------------------------------------------------
+            if (mantissa_result == 25'd0) begin
+                result = 32'h00000000;
+            end else if (!do_sub) begin
+                if (mantissa_result[24]) begin
+                    result = {result_sign, exp_large + 8'd1, mantissa_result[23:1]};
+                end else begin
+                    result = {result_sign, exp_large, mantissa_result[22:0]};
+                end
+            end else begin
+                // Priority encoder for leading zero count
+                casez (mantissa_result[23:0])
+                    24'b1???????????????????????: shift_amt = 5'd0;
+                    24'b01??????????????????????: shift_amt = 5'd1;
+                    24'b001?????????????????????: shift_amt = 5'd2;
+                    24'b0001????????????????????: shift_amt = 5'd3;
+                    24'b00001???????????????????: shift_amt = 5'd4;
+                    24'b000001??????????????????: shift_amt = 5'd5;
+                    24'b0000001?????????????????: shift_amt = 5'd6;
+                    24'b00000001????????????????: shift_amt = 5'd7;
+                    24'b000000001???????????????: shift_amt = 5'd8;
+                    24'b0000000001??????????????: shift_amt = 5'd9;
+                    24'b00000000001?????????????: shift_amt = 5'd10;
+                    24'b000000000001????????????: shift_amt = 5'd11;
+                    24'b0000000000001???????????: shift_amt = 5'd12;
+                    24'b00000000000001??????????: shift_amt = 5'd13;
+                    24'b000000000000001?????????: shift_amt = 5'd14;
+                    24'b0000000000000001????????: shift_amt = 5'd15;
+                    24'b00000000000000001???????: shift_amt = 5'd16;
+                    24'b000000000000000001??????: shift_amt = 5'd17;
+                    24'b0000000000000000001?????: shift_amt = 5'd18;
+                    24'b00000000000000000001????: shift_amt = 5'd19;
+                    24'b000000000000000000001???: shift_amt = 5'd20;
+                    24'b0000000000000000000001??: shift_amt = 5'd21;
+                    24'b00000000000000000000001?: shift_amt = 5'd22;
+                    24'b000000000000000000000001: shift_amt = 5'd23;
+                    default:                     shift_amt = 5'd0;
+                endcase
+
+                norm_mantissa = mantissa_result[23:0] << shift_amt;
+                final_exp = $signed({2'b00, exp_large}) - $signed({5'd0, shift_amt});
+
+                if (final_exp <= 0) begin
+                    result = 32'h00000000;
+                end else begin
+                    result = {result_sign, final_exp[7:0], norm_mantissa[22:0]};
+                end
+            end
+        end
     end
 
-// ============================================================
-// NORMALIZATION
-// ============================================================
-
-reg [7:0] result_exp;
-
-reg [23:0] normalized_mantissa;
-
-always @(*) begin
-    // Default values
-    result_exp = exp_large;
-    normalized_mantissa = mantissa_result[23:0];
-
-    if(mantissa_result == 0)
-        begin
-             normalized_mantissa = 0;
-              result_exp = 0;
-        end
-    else if (!do_sub) 
-        begin // ADDITION NORMALIZATION
-
-            if (mantissa_result[24] == 1'b1) begin
-                normalized_mantissa = mantissa_result[24:1];
-                result_exp = exp_large + 1;
-            end
-
-        end
-    else 
-        begin // SUBTRACTION NORMALIZATION
-
-            // 0.xxxxx → 1.xxxxx
-
-            while ((normalized_mantissa != 0) &&
-                (normalized_mantissa[23] == 1'b0)) begin
-
-                normalized_mantissa =
-                    normalized_mantissa << 1;
-
-                result_exp =
-                    result_exp - 1;
-            end
-    end
-end
-
-
-// ============================================================
-// PACKING
-// ============================================================
-
-wire [22:0] result_fraction;
-
-assign result_fraction =  normalized_mantissa[22:0];
-assign result = { result_sign, result_exp, result_fraction};  
 endmodule
